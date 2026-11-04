@@ -2,9 +2,10 @@
 
 This module loads the appropriate pre-compiled binary based on:
 - Platform (Windows/Linux)
-- Python version (3.12, 3.13)
+- Python version (3.12, 3.13, 3.14)
 
 Pre-built binaries are distributed in the wheel and require no compilation.
+Each binary only works with the PyTorch release series it was built against.
 """
 
 import importlib
@@ -64,7 +65,7 @@ def load_deform_attn():
     if py_version not in supported_versions:
         raise RuntimeError(
             f"Unsupported Python version: {sys.version_info.major}.{sys.version_info.minor}. "
-            f"vsrvrt requires Python 3.12 or 3.13.\n"
+            f"vsrvrt requires Python 3.12, 3.13 or 3.14.\n"
             f"Supported versions: {', '.join(supported_versions)}"
         )
 
@@ -79,7 +80,9 @@ def load_deform_attn():
             f"Platform: {platform_id}\n"
             f"Python: {py_version}\n"
             f"Module: {module_name}\n\n"
-            f"This usually means you're installing from source instead of a pre-built wheel.\n\n"
+            f"This usually means you're installing from source instead of a pre-built wheel,\n"
+            f"or the installed PyTorch release differs from the one the wheel was built against "
+            f"(see the torch requirement in the wheel's metadata).\n\n"
             f"Please install vsrvrt from PyPI:\n"
             f"    pip install vsrvrt\n\n"
             f"If you need to install from source, please use the development branch "

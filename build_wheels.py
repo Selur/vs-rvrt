@@ -7,19 +7,26 @@ to build all wheels.
 
 Requirements:
     - Python 3.12, 3.13, or 3.14
-    - PyTorch 2.7.1+ with CUDA 12.8
-    - CUDA Toolkit 12.8+ (for compilation)
+    - PyTorch with CUDA (2.7.1+cu128 for cp312/cp313, 2.14.1+cu130 for cp314)
+    - CUDA Toolkit with the same major version as PyTorch's CUDA (for compilation)
     - C++ compiler (MSVC on Windows, GCC on Linux)
     - ninja build system
+
+The extension is bound to the PyTorch release it was compiled against, so
+the wheel's torch requirement is pinned to that release series at build time.
+Set TORCH_CUDA_ARCH_LIST to cover all target GPUs; otherwise only the GPU of
+the build machine is supported.
 
 Usage:
     Windows:
         py -3.12 build_wheels.py    # Build wheel for Python 3.12
         py -3.13 build_wheels.py    # Build wheel for Python 3.13
+        py -3.14 build_wheels.py    # Build wheel for Python 3.14
 
     Linux:
         python3.12 build_wheels.py    # Build wheel for Python 3.12
         python3.13 build_wheels.py    # Build wheel for Python 3.13
+        python3.14 build_wheels.py    # Build wheel for Python 3.14
 
 Output:
     dist/vsrvrt-1.1.3-cp312-none-win_amd64.whl
@@ -286,6 +293,30 @@ def create_staging_directory(platform_id, py_version):
     return STAGING_DIR
 
 
+TORCH_REQUIREMENT = '"torch>=2.7.1"'
+
+
+def get_torch_pin():
+    """Torch requirement for the release series the extension was compiled against."""
+    import torch
+    from packaging.version import Version
+
+    major, minor, micro = (Version(torch.__version__).release + (0, 0))[:3]
+    return f"torch>={major}.{minor}.{micro},<{major}.{minor + 1}"
+
+
+def pin_torch_requirement(*files):
+    """Replace the generic torch requirement in the staged metadata files."""
+    pin = get_torch_pin()
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        if TORCH_REQUIREMENT not in text:
+            print(f"ERROR: {TORCH_REQUIREMENT} not found in {path.name}.")
+            sys.exit(1)
+        path.write_text(text.replace(TORCH_REQUIREMENT, f'"{pin}"'), encoding="utf-8")
+    print(f"  Torch requirement: {pin}")
+
+
 def build_wheel(platform_id, py_version):
     """Build a wheel for the specific Python version using staging directory."""
     print("Building wheel...")
@@ -304,6 +335,7 @@ def build_wheel(platform_id, py_version):
 
     shutil.copy2(setup_py, STAGING_DIR / "setup.py")
     shutil.copy2(pyproject_toml, STAGING_DIR / "pyproject.toml")
+    pin_torch_requirement(STAGING_DIR / "setup.py", STAGING_DIR / "pyproject.toml")
     if manifest_in.exists():
         shutil.copy2(manifest_in, STAGING_DIR / "MANIFEST.in")
     shutil.copy2(PROJECT_ROOT / "README.md", STAGING_DIR / "README.md")

@@ -16,10 +16,11 @@ A Vapoursynth plugin wrapper for RVRT (Recurrent Video Restoration Transformer),
 
 ## Requirements
 
-- Python >= 3.12 (3.14 not supported on Windows)
+- Python 3.12, 3.13 or 3.14
 - VapourSynth >= 60
-- PyTorch >= 2.7.1 **with CUDA support** (see important note below)
-- NVIDIA GPU with CUDA 12.8+ driver
+- PyTorch **with CUDA support** in the release series the wheel was built against (see important note below):
+  2.7.x (cu128) for Python 3.12/3.13, 2.14.x (cu130) for Python 3.14 on Windows
+- NVIDIA GPU with a driver for that CUDA version (12.8+ or 13.0+)
 
 ## Installation
 
@@ -41,14 +42,23 @@ yay -S vsrvrt-git
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
+For Python 3.14 on Windows:
+
+```bash
+pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu130
+```
+
+The pre-built extension only loads with the PyTorch release series it was compiled against; each wheel pins that series in its torch requirement.
+
 ### Building from Source
 
 If you need to build from source (e.g., for development or unsupported platforms):
 
 1. **Prerequisites:**
-   - CUDA Toolkit 12.8+
-   - C++ compiler (MSVC on Windows, GCC on Linux)
+   - CUDA Toolkit with the same major version as your PyTorch build (12.8+ for cu128, 13.0 for cu130)
+   - C++ compiler (MSVC on Windows, GCC on Linux); nvcc 13.0 accepts MSVC up to 14.4x (Visual Studio 2022 toolset)
    - ninja build system
+   - `TORCH_CUDA_ARCH_LIST` covering your target GPUs (e.g. `7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX`); otherwise only the build machine's GPU is supported
 
 2. **Build:**
    ```bash
@@ -243,7 +253,7 @@ vsrvrt/
 ├── _binary/                # Pre-built CUDA extension binaries
 │   ├── __init__.py         # Platform/version loader
 │   ├── manylinux_x86_64/   # Linux (cp312, cp313, cp314)
-│   └── win_amd64/          # Windows (cp312, cp313)
+│   └── win_amd64/          # Windows (cp312, cp313, cp314)
 ├── models/                 # Placeholder (models cached in ~/.cache/vsrvrt/)
 ├── utils/                  # Utility functions
 └── rvrt_src/               # RVRT source code
