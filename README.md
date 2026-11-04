@@ -254,7 +254,7 @@ vsrvrt/
 │   ├── __init__.py         # Platform/version loader
 │   ├── manylinux_x86_64/   # Linux (cp312, cp313, cp314)
 │   └── win_amd64/          # Windows (cp312, cp313, cp314)
-├── models/                 # Placeholder (models cached in ~/.cache/vsrvrt/)
+├── models/                 # Optional bundled weights, used before the cache (~/.cache/vsrvrt/)
 ├── utils/                  # Utility functions
 └── rvrt_src/               # RVRT source code
     ├── models/
