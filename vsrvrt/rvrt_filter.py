@@ -175,6 +175,39 @@ def _frame_to_tensor(frame: vs.VideoFrame) -> torch.Tensor:
     return tensor
 
 
+def _chunk_bounds(total_frames: int, chunk_size: int, chunk_overlap: int) -> List[Tuple[int, int]]:
+    """Split [0, total_frames) into full chunks overlapping by at least chunk_overlap; the last one ends at total_frames."""
+    if total_frames <= chunk_size:
+        return [(0, total_frames)]
+    stride = max(1, chunk_size - chunk_overlap)
+    starts = list(range(0, total_frames - chunk_size, stride)) + [total_frames - chunk_size]
+    return [(s, s + chunk_size) for s in starts]
+
+
+def _chunk_weights(chunks: List[Tuple[int, int]], idx: int) -> torch.Tensor:
+    """Blend weight per frame of chunk idx: linear ramps over the actual overlap with its neighbours."""
+    start, end = chunks[idx]
+    weights = torch.ones(end - start)
+    if idx > 0:
+        ramp = chunks[idx - 1][1] - start
+        for j in range(ramp):
+            weights[j] = (j + 1) / (ramp + 1)
+    if idx < len(chunks) - 1:
+        ramp = end - chunks[idx + 1][0]
+        for j in range(ramp):
+            k = end - start - 1 - j
+            weights[k] = min(weights[k].item(), (j + 1) / (ramp + 1))
+    return weights
+
+
+def _write_frame(img: np.ndarray, fout: vs.VideoFrame, is_float: bool) -> None:
+    """Copy a (C, H, W) float32 image in [0, 1] into the planes of fout."""
+    if not is_float:
+        img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    for p in range(3):
+        np.asarray(fout[p])[...] = img[p]
+
+
 def _create_filter_wrapper_chunked(
     src_clip: vs.VideoNode,
     config: RVRTConfig,
@@ -184,20 +217,22 @@ def _create_filter_wrapper_chunked(
     use_fp16: bool,
     device: Optional[str],
     chunk_size: int = 64,
-    chunk_overlap: int = 16,
+    chunk_overlap: int = 4,
     quiet: bool = False,
 ) -> vs.VideoNode:
-    """Create a filter wrapper with chunked CPU streaming for long videos.
+    """Create a filter wrapper that processes overlapping chunks on demand.
 
-    This allows processing videos longer than GPU memory would allow by:
-    1. Processing video in chunks with temporal overlap
-    2. Only loading current chunk into GPU memory
-    3. Blending overlapping regions for smooth transitions
+    A chunk is processed when one of its frames is requested; the last chunks
+    stay cached so that frames in an overlap blend the results of both chunks.
+    Output equals blending all chunks up front, but memory stays bounded and
+    the first frame is available after the first chunk.
 
     Args:
         chunk_size: Number of frames to process per chunk (default: 64)
-        chunk_overlap: Number of overlapping frames between chunks (default: 16)
+        chunk_overlap: Number of overlapping frames between chunks (default: 4)
     """
+    import threading
+    from collections import OrderedDict
 
     device_obj = torch.device(
         device if device else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -205,63 +240,34 @@ def _create_filter_wrapper_chunked(
     inference = RVRTInference(config, use_fp16=use_fp16, device=device_obj)
 
     total_frames = src_clip.num_frames
-
-    # Calculate chunk boundaries with overlap
-    if total_frames <= chunk_size:
-        # Short video - process all at once
-        chunks = [(0, total_frames)]
-    else:
-        # Long video - process in overlapping chunks
-        chunks = []
-        stride = chunk_size - chunk_overlap
-        start = 0
-        while start < total_frames:
-            end = min(start + chunk_size, total_frames)
-            chunks.append((start, end))
-            if end >= total_frames:
-                break
-            start += stride
+    chunks = _chunk_bounds(total_frames, chunk_size, chunk_overlap)
+    weights = [_chunk_weights(chunks, i) for i in range(len(chunks))]
+    # a frame lies in at most ceil(chunk_size / stride) + 1 chunks (the last one may overlap more)
+    stride = max(1, chunk_size - chunk_overlap)
+    cache_limit = -(-chunk_size // stride) + 2
 
     if not quiet:
-        print(f"RVRT: Processing {total_frames} frames in {len(chunks)} chunk(s)")
+        print(f"RVRT: Processing {total_frames} frames in {len(chunks)} chunk(s) on demand")
         print(f"RVRT: Chunk size={chunk_size}, overlap={chunk_overlap}")
 
-    # Process all chunks and store results
-    processed_chunks = []
+    sigma_normalized = sigma / 255.0 if sigma is not None else None
+    lock = threading.Lock()
+    cache = OrderedDict()
 
-    for chunk_idx, (start_frame, end_frame) in enumerate(chunks):
+    def process_chunk(idx: int) -> torch.Tensor:
+        start_frame, end_frame = chunks[idx]
         num_frames = end_frame - start_frame
         if not quiet:
             print(
-                f"RVRT: Processing chunk {chunk_idx + 1}/{len(chunks)} (frames {start_frame}-{end_frame - 1})"
+                f"RVRT: Processing chunk {idx + 1}/{len(chunks)} (frames {start_frame}-{end_frame - 1})"
             )
-
-        # Load frames for this chunk
-        frames = []
-        for n in range(start_frame, end_frame):
-            frame = src_clip.get_frame(n)
-            tensor = _frame_to_tensor(frame)
-            frames.append(tensor)
-
-        # Stack into chunk tensor: (1, T, C, H, W)
+        frames = [_frame_to_tensor(src_clip.get_frame(n)) for n in range(start_frame, end_frame)]
         chunk_tensor = torch.stack(frames, dim=1)
 
         # Pad partial chunks to full chunk_size to avoid model dimension mismatches
-        original_num_frames = num_frames
         if num_frames < chunk_size:
-            # Calculate padding needed
-            pad_length = chunk_size - num_frames
-            # Repeat the last frame for padding
-            last_frame = chunk_tensor[:, -1:, :, :, :]
-            padding = last_frame.repeat(1, pad_length, 1, 1, 1)
+            padding = chunk_tensor[:, -1:, :, :, :].repeat(1, chunk_size - num_frames, 1, 1, 1)
             chunk_tensor = torch.cat([chunk_tensor, padding], dim=1)
-            if not quiet:
-                print(
-                    f"RVRT: Padded chunk from {original_num_frames} to {chunk_size} frames"
-                )
-
-        # Process chunk with RVRT
-        sigma_normalized = sigma / 255.0 if sigma is not None else None
 
         with torch.no_grad():
             output_chunk = inference.inference(
@@ -270,142 +276,51 @@ def _create_filter_wrapper_chunked(
                 tile_size=tile_size,
                 tile_overlap=tile_overlap,
             )
+        output_chunk = output_chunk[0, :num_frames].float().cpu()
 
-        # Crop output back to original frame count if padded
-        if original_num_frames < chunk_size:
-            output_chunk = output_chunk[:, :original_num_frames, :, :, :]
+        del chunk_tensor
+        if device_obj.type == "cuda":
+            torch.cuda.empty_cache()
+        return output_chunk
 
-        # Store on CPU
-        processed_chunks.append((start_frame, end_frame, output_chunk.cpu()))
-
-        # Clear GPU memory
-        del chunk_tensor, output_chunk
-        torch.cuda.empty_cache()
-
-    # Blend overlapping regions between chunks
-    if len(chunks) > 1:
-        final_output = _blend_chunks(processed_chunks, total_frames, chunk_overlap)
-    else:
-        final_output = processed_chunks[0][2]
-
-    if not quiet:
-        print(f"RVRT: Final output shape: {final_output.shape}")
+    def get_chunk(idx: int) -> torch.Tensor:
+        with lock:
+            if idx in cache:
+                cache.move_to_end(idx)
+                return cache[idx]
+            output_chunk = process_chunk(idx)
+            cache[idx] = output_chunk
+            while len(cache) > cache_limit:
+                cache.popitem(last=False)
+            return output_chunk
 
     def process_frame(n, f):
-        """Extract frame n from the processed output."""
-        import ctypes
-
-        frame_tensor = final_output[0, n, ...]
-
-        # Convert to numpy
-        img = frame_tensor.cpu().numpy()
-
-        # Create a writable copy
+        acc = None
+        weight_sum = 0.0
+        for idx, (start, end) in enumerate(chunks):
+            if start <= n < end:
+                w = weights[idx][n - start].item()
+                contrib = get_chunk(idx)[n - start] * w
+                acc = contrib if acc is None else acc + contrib
+                weight_sum += w
+        img = (acc / max(weight_sum, 1e-8)).numpy()
         fout = f.copy()
-        h, w = img.shape[1], img.shape[2]
-
-        if is_float_input:
-            # RGBS output: write float32 data directly
-            for p in range(3):
-                ptr = fout.get_write_ptr(p)
-                stride = fout.get_stride(p)
-                addr = ptr.value
-                bytes_per_sample = 4  # float32
-                row_size = stride // bytes_per_sample
-                # Create float32 buffer
-                dst_buf = (ctypes.c_float * (row_size * h)).from_address(addr)
-                dst_arr = np.ctypeslib.as_array(dst_buf).reshape((h, row_size))
-                plane_data = img[p]
-                dst_arr[:, :w] = plane_data
-        else:
-            # RGB24 output: convert to uint8
-            img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
-            for p in range(3):
-                ptr = fout.get_write_ptr(p)
-                stride = fout.get_stride(p)
-                addr = ptr.value
-                buf_size = stride * h
-                dst_buf = (ctypes.c_uint8 * buf_size).from_address(addr)
-                dst_arr = np.ctypeslib.as_array(dst_buf).reshape((h, stride))
-                plane_data = img[p]
-                dst_arr[:, :w] = plane_data
-
+        _write_frame(img, fout, is_float_input)
         return fout
 
-    # Detect input format to match output
-    input_format = src_clip.format
-    is_float_input = input_format.sample_type == vs.FLOAT
+    is_float_input = src_clip.format.sample_type == vs.FLOAT
     output_format = vs.RGBS if is_float_input else vs.RGB24
 
-    # Create output clip with matching format
-    out_width = src_clip.width * config.upscale
-    out_height = src_clip.height * config.upscale
-
     blank = vs.core.std.BlankClip(
-        width=out_width,
-        height=out_height,
+        width=src_clip.width * config.upscale,
+        height=src_clip.height * config.upscale,
         format=output_format,
-        length=src_clip.num_frames,
+        length=total_frames,
         fpsnum=src_clip.fps.numerator,
         fpsden=src_clip.fps.denominator,
     )
 
     return blank.std.ModifyFrame(blank, process_frame)
-
-
-def _blend_chunks(
-    processed_chunks: List[Tuple[int, int, torch.Tensor]],
-    total_frames: int,
-    overlap: int,
-) -> torch.Tensor:
-    """Blend overlapping regions between chunks.
-
-    Args:
-        processed_chunks: List of (start_frame, end_frame, tensor) tuples
-        total_frames: Total number of frames
-        overlap: Number of overlapping frames
-
-    Returns:
-        Blended output tensor of shape (1, T, C, H, W)
-    """
-    # Get output shape from first chunk
-    _, _, first_chunk = processed_chunks[0]
-    _, _, C, H, W = first_chunk.shape
-
-    # Allocate output tensor
-    output = torch.zeros(1, total_frames, C, H, W, dtype=first_chunk.dtype)
-    weights = torch.zeros(1, total_frames, 1, 1, 1, dtype=first_chunk.dtype)
-
-    for i, (start, end, chunk) in enumerate(processed_chunks):
-        num_frames = end - start
-
-        # Create weight mask for this chunk
-        chunk_weights = torch.ones(1, num_frames, 1, 1, 1, dtype=chunk.dtype)
-
-        # Apply blending in overlap regions
-        if i > 0 and overlap > 0:
-            # Beginning of chunk overlaps with previous
-            # Ramp up from 0 to 1
-            for j in range(min(overlap, num_frames)):
-                weight = (j + 1) / (overlap + 1)
-                chunk_weights[0, j, 0, 0, 0] = weight
-
-        if i < len(processed_chunks) - 1 and overlap > 0:
-            # End of chunk overlaps with next
-            # Ramp down from 1 to 0
-            for j in range(max(0, num_frames - overlap), num_frames):
-                frames_from_end = num_frames - j
-                weight = frames_from_end / (overlap + 1)
-                chunk_weights[0, j, 0, 0, 0] = min(chunk_weights[0, j, 0, 0, 0], weight)
-
-        # Accumulate
-        output[0, start:end] += chunk[0] * chunk_weights[0]
-        weights[0, start:end] += chunk_weights[0]
-
-    # Normalize by weights
-    output = output / weights.clamp(min=1e-8)
-
-    return output
 
 
 def _create_filter_wrapper_preview(
@@ -417,7 +332,7 @@ def _create_filter_wrapper_preview(
     use_fp16: bool,
     device: Optional[str],
     chunk_size: int = 64,
-    chunk_overlap: int = 16,
+    chunk_overlap: int = 4,
     quiet: bool = False,
 ) -> vs.VideoNode:
     """Create a filter wrapper with lazy chunk processing for preview mode.
@@ -427,7 +342,7 @@ def _create_filter_wrapper_preview(
 
     Args:
         chunk_size: Number of frames to process per chunk (default: 64)
-        chunk_overlap: Number of overlapping frames between chunks (default: 16)
+        chunk_overlap: Number of overlapping frames between chunks (default: 4)
     """
     device_obj = torch.device(
         device if device else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -594,7 +509,7 @@ def _create_filter_wrapper(
     use_fp16: bool,
     device: Optional[str],
     chunk_size: int = 64,
-    chunk_overlap: int = 16,
+    chunk_overlap: int = 4,
     use_chunking: Optional[bool] = None,
     preview_mode: bool = False,
     quiet: bool = False,
@@ -796,7 +711,7 @@ def Denoise(
         use_fp16: Use FP16 precision for faster inference (default: True)
         device: Device to use ('cuda' or 'cpu'). None for auto.
         chunk_size: Number of frames per chunk for long videos. None for default (64).
-        chunk_overlap: Overlapping frames between chunks. None for default (16).
+        chunk_overlap: Overlapping frames between chunks. None for default (4).
         use_chunking: Force chunked processing on/off. None for auto-detection.
         preview_mode: If True, use lazy chunk processing for fast preview (default: False)
         quiet: If True, suppress all progress output (default: False)
@@ -825,7 +740,7 @@ def Denoise(
         use_fp16=use_fp16,
         device=device,
         chunk_size=chunk_size if chunk_size is not None else 64,
-        chunk_overlap=chunk_overlap if chunk_overlap is not None else 16,
+        chunk_overlap=chunk_overlap if chunk_overlap is not None else 4,
         use_chunking=use_chunking,
         preview_mode=preview_mode,
         quiet=quiet,
@@ -855,7 +770,7 @@ def Deblur(
         use_fp16: Use FP16 precision for faster inference (default: True)
         device: Device to use ('cuda' or 'cpu'). None for auto.
         chunk_size: Number of frames per chunk for long videos. None for default (64).
-        chunk_overlap: Overlapping frames between chunks. None for default (16).
+        chunk_overlap: Overlapping frames between chunks. None for default (4).
         use_chunking: Force chunked processing on/off. None for auto-detection.
         preview_mode: If True, use lazy chunk processing for fast preview (default: False)
         quiet: If True, suppress all progress output (default: False)
@@ -888,7 +803,7 @@ def Deblur(
         use_fp16=use_fp16,
         device=device,
         chunk_size=chunk_size if chunk_size is not None else 64,
-        chunk_overlap=chunk_overlap if chunk_overlap is not None else 16,
+        chunk_overlap=chunk_overlap if chunk_overlap is not None else 4,
         use_chunking=use_chunking,
         preview_mode=preview_mode,
         quiet=quiet,
@@ -920,7 +835,7 @@ def SuperRes(
         use_fp16: Use FP16 precision for faster inference (default: True)
         device: Device to use ('cuda' or 'cpu'). None for auto.
         chunk_size: Number of frames per chunk for long videos. None for default (64).
-        chunk_overlap: Overlapping frames between chunks. None for default (16).
+        chunk_overlap: Overlapping frames between chunks. None for default (4).
         use_chunking: Force chunked processing on/off. None for auto-detection.
         preview_mode: If True, use lazy chunk processing for fast preview (default: False)
         quiet: If True, suppress all progress output (default: False)
@@ -957,7 +872,7 @@ def SuperRes(
         use_fp16=use_fp16,
         device=device,
         chunk_size=chunk_size if chunk_size is not None else 64,
-        chunk_overlap=chunk_overlap if chunk_overlap is not None else 16,
+        chunk_overlap=chunk_overlap if chunk_overlap is not None else 4,
         use_chunking=use_chunking,
         preview_mode=preview_mode,
         quiet=quiet,

@@ -101,7 +101,7 @@ vsrvrt.Denoise(
     use_fp16: [bool] = True,        # Use FP16 precision, (default: True)
     device: [str] = None,           # 'cuda', 'cpu', or auto
     chunk_size: [int] = None,       # Frames per chunk (default: 64)
-    chunk_overlap: [int] = None,    # Overlapping frames (default: 16)
+    chunk_overlap: [int] = None,    # Overlapping frames (default: 4)
     use_chunking: [bool] = None,    # Whether to us chunked processing, (default: True)
     preview_mode: [bool] = False    # Lazy chunk processing for preview
 ) -> vs.VideoNode
@@ -169,7 +169,7 @@ Preview mode processes chunks on-demand for instant startup:
 # Preview mode - faster startup, processes chunks as needed
 denoised = vsrvrt.Denoise(clip, sigma=10.0, preview_mode=True)
 
-# Normal mode - process all chunks upfront, best quality but extreme delay
+# Normal mode - processes chunks on demand and blends their overlaps
 denoised = vsrvrt.Denoise(clip, sigma=10.0, preview_mode=False)
 ```
 
@@ -181,6 +181,8 @@ denoised = vsrvrt.Denoise(clip, sigma=10.0, preview_mode=False)
 
 ### Chunk Control
 
+Chunked processing runs a chunk when one of its frames is requested and keeps only the last few chunks in memory, so output starts after the first chunk. Frames in an overlap blend both chunks; the last chunk is a full chunk that ends at the last frame.
+
 Control how video is processed in chunks:
 
 ```python
@@ -189,7 +191,7 @@ denoised = vsrvrt.Denoise(
     clip, 
     sigma=10.0,
     chunk_size=64,        # Frames per chunk (default: 64)
-    chunk_overlap=16,     # Overlapping frames (default: 16)
+    chunk_overlap=4,      # Overlapping frames (default: 4)
     use_chunking=True     # Use chunked processing
 )
 
