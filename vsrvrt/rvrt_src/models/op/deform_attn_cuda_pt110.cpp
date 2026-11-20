@@ -100,20 +100,16 @@ void deform_attn_cuda_forward(
         dilation_h, dilation_w, deform_group, columns[n]);
     }
 
-    columns = columns.view({clip_size, 2, attn_head, attn_dim, attn_size, area})
+    // permuted copy for the matmuls; columns keeps the im2col layout, so the next batch writes into it directly
+    at::Tensor cols = columns.view({clip_size, 2, attn_head, attn_dim, attn_size, area})
                .permute({1, 2, 5, 3, 0, 4}).flatten(4); // kv x attn_head x (height*width) x attn_dim x (clip_size*attn_size)
 
     // calculate attention, (attn_head x (height*width) x 1 x attn_dim) @ (attn_head x (height*width) x attn_dim x (clip_size*attn_size))
-    attns = at::matmul(q[b], columns[0])
+    attns = at::matmul(q[b], cols[0])
                                     .softmax(-1); // (attn_head x (height*width) x 1 x (clip_size*attn_size))
     // do attention
-    output[b] = at::matmul(attns, columns[1].transpose(2, 3)) // (attn_head x (height*width) x 1 x attn_dim)
+    output[b] = at::matmul(attns, cols[1].transpose(2, 3)) // (attn_head x (height*width) x 1 x attn_dim)
                             .transpose(1, 3).view({attn_head, attn_dim, height, width}); // (attn_head x attn_dim x height x width)
-
-    // resize columns back for next batch
-    columns = columns.view({2, attn_head, area, attn_dim, clip_size , attn_size})
-                                    .permute({4, 0, 1, 3, 5, 2}) // clip_size x attn_head x attn_dim x attn_size x (height*width)
-                                    .flatten(1, 3); // clip_size x (attn_head*attn_dim*attn_size) x (height*width)
   }
 
   output = output.view({batch, channels, height, width});
